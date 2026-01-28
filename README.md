@@ -9,6 +9,8 @@ AI-agent utilities powered by x402 micropayments.
 | `/fetch` | GET | Convert URL to clean markdown/text | $0.001 |
 | `/screenshot` | GET | Capture URL as PNG/JPEG | $0.005 |
 | `/pdf` | POST | Extract text from PDF | $0.002 |
+| `/extract` | GET | Extract emails, phones, links, prices, meta from URL | $0.005 |
+| `/compare` | POST | Compare two URLs and analyze differences | $0.015 |
 
 ## Quick Start
 
@@ -85,6 +87,58 @@ Extract text from a PDF document.
   "pages": 5,
   "info": {...},
   "metadata": {...}
+}
+```
+
+### GET /extract
+
+Extract structured data from any URL.
+
+**Parameters:**
+- `url` (required) - URL to extract from
+- `types` - Comma-separated data types (default: `emails,phones,links`)
+  - `emails` - Email addresses
+  - `phones` - Phone numbers
+  - `links` - All hyperlinks
+  - `prices` - Price values ($XX.XX format)
+  - `meta` - Meta tags (title, description, OpenGraph, Twitter)
+
+**Response:**
+```json
+{
+  "url": "https://example.com",
+  "extracted": {
+    "emails": ["contact@example.com"],
+    "phones": ["555-123-4567"],
+    "links": ["https://example.com/about"],
+    "prices": ["$99.99", "$149.00"],
+    "meta": {
+      "title": "Example",
+      "description": "...",
+      "ogImage": "..."
+    }
+  }
+}
+```
+
+### POST /compare
+
+Compare two URLs and analyze differences.
+
+**Body (JSON):**
+- `url1` (required) - First URL
+- `url2` (required) - Second URL
+
+**Response:**
+```json
+{
+  "url1": { "title": "...", "length": 1234, "excerpt": "..." },
+  "url2": { "title": "...", "length": 2345, "excerpt": "..." },
+  "comparison": {
+    "titleMatch": false,
+    "lengthDiff": 1111,
+    "longer": "url2"
+  }
 }
 ```
 
