@@ -1,0 +1,14 @@
+{
+  "name": "x402-tools",
+  "version": "1.0.0",
+  "description": "AI-agent utilities via x402: Clean Fetch, Screenshot, PDF extraction",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": ["x402", "ai-agents", "api", "fetch", "screenshot", "pdf"],
+  "author": "Siamak",
+  "license": "MIT"
+}
