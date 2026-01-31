@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import puppeteer from 'puppeteer';
+import { BrowserPool, PoolError } from './browser-pool.js';
 import { Readability } from '@mozilla/readability';
 import { JSDOM } from 'jsdom';
 import { createRequire } from 'module';
@@ -50,7 +51,7 @@ const MAX_LOGS = 10000; // Keep last 10k logs in memory
 
 // API Key Authentication Middleware
 const API_KEYS = process.env.API_KEYS ? process.env.API_KEYS.split(',').map(key => key.trim()) : [];
-const PUBLIC_ENDPOINTS = ['/health', '/discovery', '/', '/register', '/usage', '/stats'];
+const PUBLIC_ENDPOINTS = ['/health', '/discovery', '/', '/register', '/usage', '/stats', '/queue/status'];
 
 const authenticateApiKey = (req, res, next) => {
   // Skip authentication for public endpoints
@@ -203,17 +204,12 @@ if (process.env.ENABLE_PAYMENTS === 'true' && paymentMiddleware) {
   }));
 }
 
-// Browser instance (reused for performance)
-let browser = null;
+// Browser pool for managed concurrency
+const pool = new BrowserPool();
 
+// Legacy helper — kept for non-pooled usage if needed
 async function getBrowser() {
-  if (!browser) {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
-  }
-  return browser;
+  return pool.getBrowser();
 }
 
 // Error handling middleware
@@ -258,13 +254,28 @@ app.get('/', (req, res) => {
 
 // Health check (free)
 app.get('/health', (req, res) => {
+  const queueStats = pool.stats;
   res.json({ 
     status: 'ok', 
     version: '2.0.0',
     services: ['fetch', 'screenshot', 'pdf', 'extract', 'compare'],
     uptime: process.uptime(),
     memory: process.memoryUsage(),
+    queue: {
+      active_requests: queueStats.active_requests,
+      queue_depth: queueStats.queue_depth,
+      max_concurrent: queueStats.max_concurrent,
+      avg_wait_ms: queueStats.avg_wait_ms,
+    },
     timestamp: new Date().toISOString()
+  });
+});
+
+// Queue status endpoint
+app.get('/queue/status', (req, res) => {
+  res.json({
+    ...pool.stats,
+    timestamp: new Date().toISOString(),
   });
 });
 
@@ -439,7 +450,7 @@ app.get('/discovery', (req, res) => {
 // ============ AUTHENTICATED ENDPOINTS ============
 
 // Clean Fetch - URL to markdown/text
-app.get('/fetch', async (req, res) => {
+app.get('/fetch', async (req, res, next) => {
   try {
     const { url, format = 'markdown' } = req.query;
     
@@ -451,38 +462,52 @@ app.get('/fetch', async (req, res) => {
       });
     }
 
-    const browser = await getBrowser();
-    const page = await browser.newPage();
-    
-    await page.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    
-    const html = await page.content();
-    await page.close();
-
-    const dom = new JSDOM(html, { url });
-    const reader = new Readability(dom.window.document);
-    const article = reader.parse();
-
-    if (!article) {
-      return res.status(422).json({ 
-        error: 'Unprocessable content',
-        message: 'Could not extract content from URL',
-        code: 'EXTRACTION_FAILED'
-      });
+    let acquired;
+    try {
+      acquired = await pool.acquire();
+    } catch (err) {
+      if (err instanceof PoolError) {
+        return res.status(err.statusCode).json({
+          error: 'Service busy',
+          message: err.message,
+          estimated_wait_ms: err.estimatedWaitMs,
+          code: 'QUEUE_FULL'
+        });
+      }
+      throw err;
     }
+    const { page, release } = acquired;
 
-    const result = {
-      title: article.title,
-      byline: article.byline,
-      content: format === 'text' ? article.textContent : article.content,
-      excerpt: article.excerpt,
-      length: article.length,
-      url: url,
-      timestamp: new Date().toISOString()
-    };
+    try {
+      await page.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      
+      const html = await page.content();
+      
+      const dom = new JSDOM(html, { url });
+      const reader = new Readability(dom.window.document);
+      const article = reader.parse();
 
-    res.json(result);
+      if (!article) {
+        return res.status(422).json({ 
+          error: 'Unprocessable content',
+          message: 'Could not extract content from URL',
+          code: 'EXTRACTION_FAILED'
+        });
+      }
+
+      res.json({
+        title: article.title,
+        byline: article.byline,
+        content: format === 'text' ? article.textContent : article.content,
+        excerpt: article.excerpt,
+        length: article.length,
+        url: url,
+        timestamp: new Date().toISOString()
+      });
+    } finally {
+      await release();
+    }
   } catch (error) {
     next(error);
   }
@@ -507,24 +532,39 @@ app.get('/screenshot', heavyEndpointLimiter, async (req, res, next) => {
       });
     }
 
-    const browser = await getBrowser();
-    const page = await browser.newPage();
-    
-    await page.setViewport({ 
-      width: parseInt(width), 
-      height: parseInt(height) 
-    });
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    
-    const screenshot = await page.screenshot({ 
-      type: format === 'jpeg' ? 'jpeg' : 'png',
-      fullPage: fullPage === 'true',
-    });
-    
-    await page.close();
+    let acquired;
+    try {
+      acquired = await pool.acquire();
+    } catch (err) {
+      if (err instanceof PoolError) {
+        return res.status(err.statusCode).json({
+          error: 'Service busy',
+          message: err.message,
+          estimated_wait_ms: err.estimatedWaitMs,
+          code: 'QUEUE_FULL'
+        });
+      }
+      throw err;
+    }
+    const { page, release } = acquired;
 
-    res.set('Content-Type', `image/${format === 'jpeg' ? 'jpeg' : 'png'}`);
-    res.send(screenshot);
+    try {
+      await page.setViewport({ 
+        width: parseInt(width), 
+        height: parseInt(height) 
+      });
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      
+      const screenshot = await page.screenshot({ 
+        type: format === 'jpeg' ? 'jpeg' : 'png',
+        fullPage: fullPage === 'true',
+      });
+
+      res.set('Content-Type', `image/${format === 'jpeg' ? 'jpeg' : 'png'}`);
+      res.send(screenshot);
+    } finally {
+      await release();
+    }
   } catch (error) {
     next(error);
   }
@@ -577,15 +617,32 @@ app.get('/extract', async (req, res, next) => {
       });
     }
 
-    const browser = await getBrowser();
-    const page = await browser.newPage();
+    let acquired;
+    try {
+      acquired = await pool.acquire();
+    } catch (err) {
+      if (err instanceof PoolError) {
+        return res.status(err.statusCode).json({
+          error: 'Service busy',
+          message: err.message,
+          estimated_wait_ms: err.estimatedWaitMs,
+          code: 'QUEUE_FULL'
+        });
+      }
+      throw err;
+    }
+    const { page, release } = acquired;
     
-    await page.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-    
-    const html = await page.content();
-    const pageUrl = page.url();
-    await page.close();
+    let html, pageUrl;
+    try {
+      await page.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+      
+      html = await page.content();
+      pageUrl = page.url();
+    } finally {
+      await release();
+    }
 
     const typesArray = types.split(',').map(t => t.trim().toLowerCase());
     const result = { 
@@ -660,21 +717,59 @@ app.post('/compare', heavyEndpointLimiter, async (req, res, next) => {
       });
     }
 
-    const browser = await getBrowser();
-    
-    // Fetch first URL
-    const page1 = await browser.newPage();
-    await page1.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
-    await page1.goto(url1, { waitUntil: 'networkidle2', timeout: 30000 });
-    const html1 = await page1.content();
-    await page1.close();
+    // Fetch first URL via pool
+    let html1;
+    {
+      let acquired;
+      try {
+        acquired = await pool.acquire();
+      } catch (err) {
+        if (err instanceof PoolError) {
+          return res.status(err.statusCode).json({
+            error: 'Service busy',
+            message: err.message,
+            estimated_wait_ms: err.estimatedWaitMs,
+            code: 'QUEUE_FULL'
+          });
+        }
+        throw err;
+      }
+      const { page, release } = acquired;
+      try {
+        await page.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
+        await page.goto(url1, { waitUntil: 'networkidle2', timeout: 30000 });
+        html1 = await page.content();
+      } finally {
+        await release();
+      }
+    }
 
-    // Fetch second URL
-    const page2 = await browser.newPage();
-    await page2.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
-    await page2.goto(url2, { waitUntil: 'networkidle2', timeout: 30000 });
-    const html2 = await page2.content();
-    await page2.close();
+    // Fetch second URL via pool
+    let html2;
+    {
+      let acquired;
+      try {
+        acquired = await pool.acquire();
+      } catch (err) {
+        if (err instanceof PoolError) {
+          return res.status(err.statusCode).json({
+            error: 'Service busy',
+            message: err.message,
+            estimated_wait_ms: err.estimatedWaitMs,
+            code: 'QUEUE_FULL'
+          });
+        }
+        throw err;
+      }
+      const { page, release } = acquired;
+      try {
+        await page.setUserAgent('Mozilla/5.0 (compatible; x402-tools/2.0)');
+        await page.goto(url2, { waitUntil: 'networkidle2', timeout: 30000 });
+        html2 = await page.content();
+      } finally {
+        await release();
+      }
+    }
 
     // Parse both
     const dom1 = new JSDOM(html1, { url: url1 });
@@ -719,9 +814,7 @@ app.use(handleError);
 const gracefulShutdown = async () => {
   console.log('Received shutdown signal, closing server gracefully...');
   
-  if (browser) {
-    await browser.close();
-  }
+  await pool.shutdown();
   
   process.exit(0);
 };
